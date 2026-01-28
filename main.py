@@ -1,12 +1,18 @@
-# main.py
+from fastapi import FastAPI, Request, HTTPException
 import os
 import requests
-from fastapi import FastAPI, Request, HTTPException
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from uuid import uuid4
 from cryptography.fernet import Fernet
-from fastapi_utils.tasks import repeat_every
+import asyncio
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def is_token_expired(user: dict) -> bool:
+    expires_at = user["auth"]["expires_at"]
+    return datetime.utcnow() >= expires_at
 
 # -------------------------------------------------
 # App
@@ -20,13 +26,11 @@ CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 MONGO_URI = os.getenv("MONGO_URI")
 FERNET_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
-REDIRECT_URI = os.getenv(
-    "LINKEDIN_REDIRECT_URI",
-    "https://yourdomain.com/callback"
-)
+
+REDIRECT_URI = "https://linkedin-backend-production-1a8f.up.railway.app/callback"
 
 if not all([CLIENT_ID, CLIENT_SECRET, MONGO_URI, FERNET_KEY]):
-    raise RuntimeError("Missing environment variables")
+    raise RuntimeError("Missing required environment variables")
 
 fernet = Fernet(FERNET_KEY)
 
@@ -38,15 +42,6 @@ db = mongo_client["linkedin_agent"]
 users = db["users"]
 
 # -------------------------------------------------
-# Utils
-# -------------------------------------------------
-def is_token_expired(user: dict) -> bool:
-    expires_at = user.get("auth", {}).get("expires_at")
-    if not expires_at:
-        return True
-    return datetime.utcnow() >= expires_at
-
-# -------------------------------------------------
 # Health
 # -------------------------------------------------
 @app.get("/")
@@ -54,47 +49,14 @@ def health():
     return {"status": "backend running"}
 
 # -------------------------------------------------
-# Create new internal user + generate OAuth link
-# -------------------------------------------------
-@app.post("/create_user")
-def create_user(name: str):
-    user_id = str(uuid4())
-    users.insert_one({
-        "internal_id": user_id,
-        "name": name,
-        "linkedin": {},
-        "auth": {},
-        "drafts": [],
-        "posts": [],
-        "has_posted": False,
-        "created_at": datetime.utcnow()
-    })
-
-    # Generate LinkedIn OAuth URL
-    oauth_url = (
-        f"https://www.linkedin.com/oauth/v2/authorization?"
-        f"response_type=code&client_id={CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}"
-        f"&scope=r_liteprofile%20w_member_social"
-        f"&state={user_id}"
-    )
-
-    return {"user_id": user_id, "oauth_url": oauth_url}
-
-# -------------------------------------------------
 # LinkedIn OAuth Callback
 # -------------------------------------------------
 @app.get("/callback")
 def linkedin_callback(request: Request):
     code = request.query_params.get("code")
-    state = request.query_params.get("state")  # internal user ID
 
-    if not code or not state:
-        raise HTTPException(status_code=400, detail="No code or state received")
-
-    user = users.find_one({"internal_id": state})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    if not code:
+        raise HTTPException(status_code=400, detail="No code received")
 
     # Exchange code -> access token
     token_res = requests.post(
@@ -113,24 +75,24 @@ def linkedin_callback(request: Request):
     expires_in = token_res.get("expires_in")
 
     if not access_token:
-        raise HTTPException(status_code=400, detail=f"LinkedIn error: {token_res}")
+        return token_res
 
-    # Fetch LinkedIn profile
-    profile = requests.get(
-        "https://api.linkedin.com/v2/me",
+    # Fetch user info
+    userinfo = requests.get(
+        "https://api.linkedin.com/v2/userinfo",
         headers={"Authorization": f"Bearer {access_token}"},
     ).json()
 
-    linkedin_user_id = profile.get("id")
+    linkedin_user_id = userinfo.get("sub")
     if not linkedin_user_id:
-        raise HTTPException(status_code=400, detail="Could not fetch LinkedIn user")
+        raise HTTPException(status_code=400, detail="Unable to fetch LinkedIn user")
 
     linkedin_urn = f"urn:li:person:{linkedin_user_id}"
     encrypted_token = fernet.encrypt(access_token.encode()).decode()
 
-    # Update user with LinkedIn info
+    # Upsert user
     users.update_one(
-        {"internal_id": state},
+        {"linkedin.user_id": linkedin_user_id},
         {
             "$set": {
                 "linkedin.user_id": linkedin_user_id,
@@ -138,11 +100,22 @@ def linkedin_callback(request: Request):
                 "auth.access_token": encrypted_token,
                 "auth.expires_at": datetime.utcnow() + timedelta(seconds=expires_in),
                 "updated_at": datetime.utcnow(),
-            }
-        }
+            },
+            "$setOnInsert": {
+                "drafts": [],
+                "posts": [],
+                "has_posted": False,
+                "created_at": datetime.utcnow(),
+            },
+        },
+        upsert=True,
     )
 
-    return {"message": "OAuth success! You can now post automatically."}
+    return {
+        "linkedin_user_id": linkedin_user_id,
+        "linkedin_urn": linkedin_urn,
+        "expires_in": expires_in,
+    }
 
 # -------------------------------------------------
 # Drafts
@@ -168,9 +141,14 @@ def add_draft(user_id: str, text: str):
 
 @app.get("/drafts")
 def get_drafts(user_id: str):
-    user = users.find_one({"linkedin.user_id": user_id}, {"_id": 0, "drafts": 1})
+    user = users.find_one(
+        {"linkedin.user_id": user_id},
+        {"_id": 0, "drafts": 1},
+    )
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     return user["drafts"]
 
 # -------------------------------------------------
@@ -182,8 +160,12 @@ def create_post(user_id: str, text: str):
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     if is_token_expired(user):
-        raise HTTPException(status_code=401, detail="LinkedIn token expired.")
+        raise HTTPException(
+            status_code=401,
+            detail="LinkedIn token expired. User must re-authenticate."
+        )
 
     encrypted_token = user["auth"]["access_token"]
     access_token = fernet.decrypt(encrypted_token.encode()).decode()
@@ -211,54 +193,69 @@ def create_post(user_id: str, text: str):
         },
     ).json()
 
-    if res.get("id"):
+    post_id = res.get("id")
+
+    if post_id:
         users.update_one(
             {"linkedin.user_id": user_id},
-            {"$push": {"posts": {"post_id": res["id"], "text": text, "posted_at": datetime.utcnow()}}}
+            {
+                "$push": {
+                    "posts": {
+                        "post_id": post_id,
+                        "text": text,
+                        "posted_at": datetime.utcnow(),
+                    }
+                }
+            },
         )
 
     return res
 
 # -------------------------------------------------
-# Background task: auto post welcome message for new users
+# Automatic Post for New Users
 # -------------------------------------------------
 @app.on_event("startup")
-@repeat_every(seconds=60)
-def auto_post_for_new_users():
-    new_users = users.find({
-        "auth.access_token": {"$exists": True},
-        "has_posted": False
-    })
+async def auto_post_for_new_users():
+    async def run_periodically():
+        while True:
+            try:
+                new_users = users.find({
+                    "auth.access_token": {"$exists": True},
+                    "has_posted": {"$ne": True}
+                })
 
-    for user in new_users:
-        try:
-            encrypted_token = user["auth"]["access_token"]
-            access_token = fernet.decrypt(encrypted_token.encode()).decode()
-            author_urn = user["linkedin"]["urn"]
+                for user in new_users:
+                    encrypted_token = user["auth"]["access_token"]
+                    access_token = fernet.decrypt(encrypted_token.encode()).decode()
+                    author_urn = user["linkedin"]["urn"]
 
-            res = requests.post(
-                "https://api.linkedin.com/v2/ugcPosts",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "X-Restli-Protocol-Version": "2.0.0",
-                },
-                json={
-                    "author": author_urn,
-                    "lifecycleState": "PUBLISHED",
-                    "specificContent": {
-                        "com.linkedin.ugc.ShareContent": {
-                            "shareCommentary": {"text": "Welcome! First automated post."},
-                            "shareMediaCategory": "NONE",
-                        }
-                    },
-                    "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
-                },
-            ).json()
+                    res = requests.post(
+                        "https://api.linkedin.com/v2/ugcPosts",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                            "X-Restli-Protocol-Version": "2.0.0",
+                        },
+                        json={
+                            "author": author_urn,
+                            "lifecycleState": "PUBLISHED",
+                            "specificContent": {
+                                "com.linkedin.ugc.ShareContent": {
+                                    "shareCommentary": {"text": "Welcome! First automated post."},
+                                    "shareMediaCategory": "NONE",
+                                }
+                            },
+                            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+                        },
+                    ).json()
 
-            if res.get("id"):
-                users.update_one({"_id": user["_id"]}, {"$set": {"has_posted": True}})
+                    if res.get("id"):
+                        users.update_one({"_id": user["_id"]}, {"$set": {"has_posted": True}})
+                        print(f"Auto-posted for {user['linkedin']['user_id']}")
 
-        except Exception as e:
-            print(f"Error auto-posting for user {user['_id']}: {e}")
+            except Exception as e:
+                print(f"Error in auto-posting task: {e}")
 
+            await asyncio.sleep(60)  # repeat every 60 seconds
+
+    asyncio.create_task(run_periodically())
