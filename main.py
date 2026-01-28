@@ -5,7 +5,18 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 from uuid import uuid4
 from cryptography.fernet import Fernet
-from fastapi_utils.tasks import repeat_every
+import asyncio  # at the top of your file
+
+async def auto_post_loop():
+    while True:
+        new_users = users.find({"has_posted": False})
+        for user in new_users:
+            post_to_linkedin(user, "Welcome to our LinkedIn automation platform!")
+        await asyncio.sleep(60)  # run every 60 seconds
+
+@app.on_event("startup")
+async def start_background_tasks():
+    asyncio.create_task(auto_post_loop())
 
 # -------------------------------------------------
 # Helper
