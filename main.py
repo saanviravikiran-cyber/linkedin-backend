@@ -4,38 +4,45 @@ import requests
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from uuid import uuid4
+from cryptography.fernet import Fernet
 
-# ---------------------------
+# -------------------------------------------------
 # App
-# ---------------------------
+# -------------------------------------------------
 app = FastAPI()
 
-# ---------------------------
-# Env
-# ---------------------------
+# -------------------------------------------------
+# Environment
+# -------------------------------------------------
 CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 MONGO_URI = os.getenv("MONGO_URI")
+FERNET_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 
 REDIRECT_URI = "https://linkedin-backend-production-1a8f.up.railway.app/callback"
 
-# ---------------------------
-# Mongo
-# ---------------------------
+if not all([CLIENT_ID, CLIENT_SECRET, MONGO_URI, FERNET_KEY]):
+    raise RuntimeError("Missing required environment variables")
+
+fernet = Fernet(FERNET_KEY)
+
+# -------------------------------------------------
+# MongoDB
+# -------------------------------------------------
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["linkedin_agent"]
 users = db["users"]
 
-# ---------------------------
+# -------------------------------------------------
 # Health
-# ---------------------------
+# -------------------------------------------------
 @app.get("/")
 def health():
     return {"status": "backend running"}
 
-# ---------------------------
+# -------------------------------------------------
 # LinkedIn OAuth Callback
-# ---------------------------
+# -------------------------------------------------
 @app.get("/callback")
 def linkedin_callback(request: Request):
     code = request.query_params.get("code")
@@ -75,15 +82,18 @@ def linkedin_callback(request: Request):
 
     linkedin_urn = f"urn:li:person:{linkedin_user_id}"
 
-    # Store / update user in MongoDB
+    encrypted_token = fernet.encrypt(access_token.encode()).decode()
+
+    # Upsert user
     users.update_one(
         {"linkedin.user_id": linkedin_user_id},
         {
             "$set": {
                 "linkedin.user_id": linkedin_user_id,
                 "linkedin.urn": linkedin_urn,
-                "auth.access_token": access_token,
-                "auth.expires_at": datetime.utcnow() + timedelta(seconds=expires_in),
+                "auth.access_token": encrypted_token,
+                "auth.expires_at": datetime.utcnow()
+                + timedelta(seconds=expires_in),
                 "updated_at": datetime.utcnow(),
             },
             "$setOnInsert": {
@@ -101,9 +111,9 @@ def linkedin_callback(request: Request):
         "expires_in": expires_in,
     }
 
-# ---------------------------
+# -------------------------------------------------
 # Drafts
-# ---------------------------
+# -------------------------------------------------
 @app.post("/drafts")
 def add_draft(user_id: str, text: str):
     draft = {
@@ -135,9 +145,9 @@ def get_drafts(user_id: str):
 
     return user["drafts"]
 
-# ---------------------------
+# -------------------------------------------------
 # Create LinkedIn Post
-# ---------------------------
+# -------------------------------------------------
 @app.post("/post")
 def create_post(user_id: str, text: str):
     user = users.find_one({"linkedin.user_id": user_id})
@@ -145,7 +155,8 @@ def create_post(user_id: str, text: str):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    access_token = user["auth"]["access_token"]
+    encrypted_token = user["auth"]["access_token"]
+    access_token = fernet.decrypt(encrypted_token.encode()).decode()
     author_urn = user["linkedin"]["urn"]
 
     res = requests.post(
