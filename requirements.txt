@@ -1,5 +1,10 @@
 fastapi
 uvicorn
 requests
+pymongo
+python-dotenv
+cryptography
+
+
 
 
