@@ -4,7 +4,6 @@ requests
 pymongo
 python-dotenv
 cryptography
-fastapi-utils
 
 
 
