@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 from cryptography.fernet import Fernet
 
+def is_token_expired(user: dict) -> bool:
+    expires_at = user["auth"]["expires_at"]
+    return datetime.utcnow() >= expires_at
+
 # -------------------------------------------------
 # App
 # -------------------------------------------------
@@ -151,6 +155,11 @@ def get_drafts(user_id: str):
 @app.post("/post")
 def create_post(user_id: str, text: str):
     user = users.find_one({"linkedin.user_id": user_id})
+    if is_token_expired(user):
+    raise HTTPException(
+        status_code=401,
+        detail="LinkedIn token expired. User must re-authenticate."
+    )
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
