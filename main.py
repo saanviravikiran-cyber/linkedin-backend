@@ -2,6 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from pymongo import MongoClient
 from datetime import datetime
+from fastapi import Request
 from cryptography.fernet import Fernet
 import requests
 import os
@@ -125,4 +126,79 @@ def manual_post(user_id: str, text: str):
         raise HTTPException(status_code=404, detail="User not found")
 
     return create_linkedin_post(user, text)
+
+@app.get("/callback")
+def linkedin_callback(request: Request):
+    code = request.query_params.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
+    # 1. Exchange code for access token
+    token_res = requests.post(
+        "https://www.linkedin.com/oauth/v2/accessToken",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10,
+    )
+
+    if token_res.status_code != 200:
+        raise HTTPException(status_code=400, detail=token_res.text)
+
+    token_data = token_res.json()
+    access_token = token_data["access_token"]
+    expires_in = token_data["expires_in"]
+
+    # 2. Fetch LinkedIn profile
+    profile_res = requests.get(
+        "https://api.linkedin.com/v2/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+
+    if profile_res.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to fetch LinkedIn profile")
+
+    profile = profile_res.json()
+    linkedin_id = profile.get("id")
+    linkedin_urn = f"urn:li:person:{linkedin_id}"
+
+    # 3. Encrypt token
+    encrypted_token = fernet.encrypt(access_token.encode()).decode()
+
+    # 4. Store / upsert user
+    users.update_one(
+        {"linkedin.user_id": linkedin_id},
+        {
+            "$set": {
+                "linkedin": {
+                    "user_id": linkedin_id,
+                    "urn": linkedin_urn,
+                },
+                "auth": {
+                    "access_token": encrypted_token,
+                    "expires_at": datetime.utcnow() + timedelta(seconds=expires_in),
+                },
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {
+                "drafts": [],
+                "posts": [],
+                "created_at": datetime.utcnow(),
+            },
+        },
+        upsert=True,
+    )
+
+    return {
+        "message": "LinkedIn connected successfully",
+        "linkedin_user_id": linkedin_id,
+        "linkedin_urn": linkedin_urn,
+        "expires_in": expires_in,
+    }
 
