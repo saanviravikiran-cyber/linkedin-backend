@@ -156,10 +156,13 @@ def linkedin_callback(request: Request):
 
     # 2. Fetch LinkedIn profile
     profile_res = requests.get(
-        "https://api.linkedin.com/v2/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=10,
-    )
+    "https://api.linkedin.com/v2/me",
+    headers={
+        "Authorization": f"Bearer {access_token}",
+        "X-Restli-Protocol-Version": "2.0.0",
+    },
+    timeout=10,
+)
 
     if profile_res.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch LinkedIn profile")
