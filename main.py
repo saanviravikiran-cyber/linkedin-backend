@@ -27,6 +27,7 @@ fernet = Fernet(FERNET_KEY)
 client = MongoClient(MONGO_URI)
 db = client["linkedin_agent"]
 users = db["users"]
+pkce_states = db["pkce_states"]  # Store PKCE code_verifiers temporarily
 
 # -------------------------------------------------
 # FastAPI app
@@ -117,6 +118,20 @@ def health():
     return {"status": "backend running"}
 
 # -------------------------------------------------
+# PKCE State Management
+# -------------------------------------------------
+@app.post("/pkce/store")
+def store_pkce_state(state: str, code_verifier: str):
+    """Store PKCE code_verifier temporarily, expires in 10 minutes"""
+    pkce_states.insert_one({
+        "state": state,
+        "code_verifier": code_verifier,
+        "created_at": datetime.utcnow(),
+        "expires_at": datetime.utcnow() + timedelta(minutes=10)
+    })
+    return {"status": "stored"}
+
+# -------------------------------------------------
 # Manual post endpoint (used by agent tool)
 # -------------------------------------------------
 @app.post("/post")
@@ -131,7 +146,7 @@ def manual_post(user_id: str, text: str):
 # OAuth callback endpoint
 # -------------------------------------------------
 @app.get("/callback")
-def linkedin_callback(request: Request, code_verifier: str = None):
+def linkedin_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
@@ -143,7 +158,6 @@ def linkedin_callback(request: Request, code_verifier: str = None):
     print(f"State: {state}")
     print(f"Error: {error}")
     print(f"Error Description: {error_description}")
-    print(f"Code Verifier: {code_verifier[:20] if code_verifier else 'None'}...")
     
     # Check for OAuth errors
     if error:
@@ -155,21 +169,37 @@ def linkedin_callback(request: Request, code_verifier: str = None):
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
     
-    # For PKCE, we need the code_verifier
-    # Temporary: use a query parameter (not secure, but for testing)
-    # In production: retrieve from session/database using state parameter
-    if not code_verifier:
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing state parameter")
+    
+    # Retrieve code_verifier from database using state
+    pkce_record = pkce_states.find_one({"state": state})
+    
+    if not pkce_record:
         raise HTTPException(
             status_code=400, 
-            detail="Missing code_verifier. Add ?code_verifier=YOUR_CODE_VERIFIER to the URL"
+            detail="PKCE state not found or expired. Please start the OAuth flow again."
         )
+    
+    # Check if expired
+    if datetime.utcnow() > pkce_record.get("expires_at"):
+        pkce_states.delete_one({"_id": pkce_record["_id"]})
+        raise HTTPException(
+            status_code=400,
+            detail="PKCE state expired. Please start the OAuth flow again."
+        )
+    
+    code_verifier = pkce_record["code_verifier"]
+    print(f"Code Verifier retrieved: {code_verifier[:20]}...")
+    
+    # Delete the used PKCE state (one-time use)
+    pkce_states.delete_one({"_id": pkce_record["_id"]})
     
     # 1. Exchange code for access token with PKCE
     print(f"=== Exchanging Code for Token (with PKCE) ===")
     print(f"CLIENT_ID: {CLIENT_ID}")
     print(f"REDIRECT_URI: {REDIRECT_URI}")
     print(f"CLIENT_SECRET: {'*' * 10} (hidden)")
-    print(f"Code Verifier: {code_verifier[:20]}...")
     
     token_data = {
         "grant_type": "authorization_code",
