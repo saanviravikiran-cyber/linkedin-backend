@@ -131,7 +131,7 @@ def manual_post(user_id: str, text: str):
 # OAuth callback endpoint
 # -------------------------------------------------
 @app.get("/callback")
-def linkedin_callback(request: Request):
+def linkedin_callback(request: Request, code_verifier: str = None):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
@@ -143,7 +143,7 @@ def linkedin_callback(request: Request):
     print(f"State: {state}")
     print(f"Error: {error}")
     print(f"Error Description: {error_description}")
-    print(f"Full query params: {dict(request.query_params)}")
+    print(f"Code Verifier: {code_verifier[:20] if code_verifier else 'None'}...")
     
     # Check for OAuth errors
     if error:
@@ -155,11 +155,21 @@ def linkedin_callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
     
-    # 1. Exchange code for access token
-    print(f"=== Exchanging Code for Token ===")
+    # For PKCE, we need the code_verifier
+    # Temporary: use a query parameter (not secure, but for testing)
+    # In production: retrieve from session/database using state parameter
+    if not code_verifier:
+        raise HTTPException(
+            status_code=400, 
+            detail="Missing code_verifier. Add ?code_verifier=YOUR_CODE_VERIFIER to the URL"
+        )
+    
+    # 1. Exchange code for access token with PKCE
+    print(f"=== Exchanging Code for Token (with PKCE) ===")
     print(f"CLIENT_ID: {CLIENT_ID}")
     print(f"REDIRECT_URI: {REDIRECT_URI}")
     print(f"CLIENT_SECRET: {'*' * 10} (hidden)")
+    print(f"Code Verifier: {code_verifier[:20]}...")
     
     token_data = {
         "grant_type": "authorization_code",
@@ -167,6 +177,7 @@ def linkedin_callback(request: Request):
         "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
+        "code_verifier": code_verifier,  # PKCE parameter
     }
     
     token_res = requests.post(
