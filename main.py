@@ -1,6 +1,6 @@
 # main.py
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pymongo import MongoClient
 from fastapi import Request
 from cryptography.fernet import Fernet
@@ -8,6 +8,7 @@ import requests
 import os
 import hashlib
 import base64
+from typing import Optional
 
 # -------------------------------------------------
 # Environment variables
@@ -17,11 +18,30 @@ CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 FERNET_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI")
+AGENT_TOKEN = os.getenv("AGENT_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkZXZfNmUyZjk0OWYtNWVkNi00MTA4LTgzYTItZTE0ZmNkMGEyZGZiIiwiZXhwIjoxNzY5ODU3MzY2fQ.DpcNPbwGljxWs7yTbTj0RAaOXj8JOVdXKWbx9oSMff8")
 
 if not all([MONGO_URI, CLIENT_ID, CLIENT_SECRET, FERNET_KEY, REDIRECT_URI]):
     raise RuntimeError("Missing required environment variables")
 
 fernet = Fernet(FERNET_KEY)
+
+# -------------------------------------------------
+# Authentication
+# -------------------------------------------------
+def verify_agent_token(authorization: Optional[str] = Header(None)):
+    """Verify the agent token from Authorization header"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    if token != AGENT_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+    
+    return True
 
 # -------------------------------------------------
 # MongoDB setup
@@ -135,10 +155,11 @@ def store_pkce_state(state: str, code_verifier: str, code_challenge: str = None)
     return {"status": "stored"}
 
 # -------------------------------------------------
-# Manual post endpoint (used by agent tool)
+# Manual post endpoint (used by agent tool) - PROTECTED
 # -------------------------------------------------
 @app.post("/post")
-def manual_post(user_id: str, text: str):
+def manual_post(user_id: str, text: str, authenticated: bool = Depends(verify_agent_token)):
+    """Post to LinkedIn - requires valid agent token"""
     user = users.find_one({"linkedin.user_id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -166,64 +187,26 @@ def linkedin_callback(request: Request):
     if error:
         raise HTTPException(
             status_code=400, 
-            detail=f"LinkedIn OAuth error: {error} - {error_description}"
-        )
+            detail=f"LinkedIn OAuth error: {error} - {error_description}")
     
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
     
-    if not state:
-        raise HTTPException(status_code=400, detail="Missing state parameter")
-    
-    # Retrieve code_verifier from database using state
-    pkce_record = pkce_states.find_one({"state": state})
-    
-    if not pkce_record:
-        raise HTTPException(
-            status_code=400, 
-            detail="PKCE state not found or expired. Please start the OAuth flow again."
-        )
-    
-    # Check if expired
-    if datetime.utcnow() > pkce_record.get("expires_at"):
-        pkce_states.delete_one({"_id": pkce_record["_id"]})
-        raise HTTPException(
-            status_code=400,
-            detail="PKCE state expired. Please start the OAuth flow again."
-        )
-    
-    code_verifier = pkce_record["code_verifier"]
-    stored_challenge = pkce_record.get("code_challenge")
-    
-    print(f"Code Verifier retrieved: {code_verifier}")
-    print(f"Code Verifier length: {len(code_verifier)}")
-    print(f"Stored code_challenge: {stored_challenge}")
-    
-    # Verify code_challenge for debugging
-    expected_challenge_bytes = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-    expected_challenge = base64.urlsafe_b64encode(expected_challenge_bytes).decode('utf-8').replace('=', '')
-    print(f"Calculated code_challenge: {expected_challenge}")
-    print(f"Challenges match: {stored_challenge == expected_challenge}")
-    
-    # Delete the used PKCE state (one-time use)
-    pkce_states.delete_one({"_id": pkce_record["_id"]})
-    
-    # 1. Exchange code for access token with PKCE
-    print(f"=== Exchanging Code for Token (with PKCE) ===")
+    # SIMPLE OAuth 2.0 token exchange - NO PKCE
+    print(f"=== Exchanging Code for Token (Simple OAuth) ===")
     print(f"CLIENT_ID: {CLIENT_ID}")
     print(f"REDIRECT_URI: {REDIRECT_URI}")
-    print(f"Code verifier length: {len(code_verifier)}")
     
-    # Try WITHOUT client_secret first (PKCE flow for public clients)
     token_data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID,
-        "code_verifier": code_verifier,  # PKCE parameter
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
     }
     
-    print(f"Sending token request with params: {list(token_data.keys())}")
+    print(f"Sending token request...")
+    print(f"Request body: {token_data}")
     
     token_res = requests.post(
         "https://www.linkedin.com/oauth/v2/accessToken",
@@ -232,28 +215,11 @@ def linkedin_callback(request: Request):
         timeout=10,
     )
 
-    print(f"Token response status (without secret): {token_res.status_code}")
-    print(f"Response headers: {dict(token_res.headers)}")
-    
-    # If that fails, try WITH client_secret (confidential client PKCE)
-    if token_res.status_code != 200:
-        print(f"First attempt failed: {token_res.text}")
-        print(f"Trying with client_secret...")
-        
-        token_data["client_secret"] = CLIENT_SECRET
-        
-        token_res = requests.post(
-            "https://www.linkedin.com/oauth/v2/accessToken",
-            data=token_data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
-        )
-        
-        print(f"Token response status (with secret): {token_res.status_code}")
+    print(f"Token response status: {token_res.status_code}")
+    print(f"Full response: {token_res.text}")
     
     if token_res.status_code != 200:
         print(f"Token exchange failed!")
-        print(f"Response: {token_res.text}")
         raise HTTPException(status_code=400, detail=token_res.text)
 
     token_data = token_res.json()
