@@ -123,11 +123,12 @@ def health():
 # PKCE State Management
 # -------------------------------------------------
 @app.post("/pkce/store")
-def store_pkce_state(state: str, code_verifier: str):
-    """Store PKCE code_verifier temporarily, expires in 10 minutes"""
+def store_pkce_state(state: str, code_verifier: str, code_challenge: str = None):
+    """Store PKCE code_verifier and code_challenge temporarily, expires in 10 minutes"""
     pkce_states.insert_one({
         "state": state,
         "code_verifier": code_verifier,
+        "code_challenge": code_challenge,  # Store for verification
         "created_at": datetime.utcnow(),
         "expires_at": datetime.utcnow() + timedelta(minutes=10)
     })
@@ -192,13 +193,17 @@ def linkedin_callback(request: Request):
         )
     
     code_verifier = pkce_record["code_verifier"]
+    stored_challenge = pkce_record.get("code_challenge")
+    
     print(f"Code Verifier retrieved: {code_verifier}")
     print(f"Code Verifier length: {len(code_verifier)}")
+    print(f"Stored code_challenge: {stored_challenge}")
     
     # Verify code_challenge for debugging
     expected_challenge_bytes = hashlib.sha256(code_verifier.encode('utf-8')).digest()
     expected_challenge = base64.urlsafe_b64encode(expected_challenge_bytes).decode('utf-8').replace('=', '')
-    print(f"Expected code_challenge: {expected_challenge}")
+    print(f"Calculated code_challenge: {expected_challenge}")
+    print(f"Challenges match: {stored_challenge == expected_challenge}")
     
     # Delete the used PKCE state (one-time use)
     pkce_states.delete_one({"_id": pkce_record["_id"]})
