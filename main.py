@@ -6,6 +6,8 @@ from fastapi import Request
 from cryptography.fernet import Fernet
 import requests
 import os
+import hashlib
+import base64
 
 # -------------------------------------------------
 # Environment variables
@@ -190,7 +192,13 @@ def linkedin_callback(request: Request):
         )
     
     code_verifier = pkce_record["code_verifier"]
-    print(f"Code Verifier retrieved: {code_verifier[:20]}...")
+    print(f"Code Verifier retrieved: {code_verifier}")
+    print(f"Code Verifier length: {len(code_verifier)}")
+    
+    # Verify code_challenge for debugging
+    expected_challenge_bytes = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    expected_challenge = base64.urlsafe_b64encode(expected_challenge_bytes).decode('utf-8').replace('=', '')
+    print(f"Expected code_challenge: {expected_challenge}")
     
     # Delete the used PKCE state (one-time use)
     pkce_states.delete_one({"_id": pkce_record["_id"]})
