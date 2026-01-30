@@ -4,6 +4,6 @@ requests
 pymongo
 python-dotenv
 cryptography
-
+PyJWT
 
 
