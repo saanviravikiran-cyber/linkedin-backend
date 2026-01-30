@@ -199,16 +199,18 @@ def linkedin_callback(request: Request):
     print(f"=== Exchanging Code for Token (with PKCE) ===")
     print(f"CLIENT_ID: {CLIENT_ID}")
     print(f"REDIRECT_URI: {REDIRECT_URI}")
-    print(f"CLIENT_SECRET: {'*' * 10} (hidden)")
+    print(f"Code verifier length: {len(code_verifier)}")
     
+    # Try WITHOUT client_secret first (PKCE flow for public clients)
     token_data = {
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
         "code_verifier": code_verifier,  # PKCE parameter
     }
+    
+    print(f"Sending token request with params: {list(token_data.keys())}")
     
     token_res = requests.post(
         "https://www.linkedin.com/oauth/v2/accessToken",
@@ -217,7 +219,24 @@ def linkedin_callback(request: Request):
         timeout=10,
     )
 
-    print(f"Token response status: {token_res.status_code}")
+    print(f"Token response status (without secret): {token_res.status_code}")
+    print(f"Response headers: {dict(token_res.headers)}")
+    
+    # If that fails, try WITH client_secret (confidential client PKCE)
+    if token_res.status_code != 200:
+        print(f"First attempt failed: {token_res.text}")
+        print(f"Trying with client_secret...")
+        
+        token_data["client_secret"] = CLIENT_SECRET
+        
+        token_res = requests.post(
+            "https://www.linkedin.com/oauth/v2/accessToken",
+            data=token_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        
+        print(f"Token response status (with secret): {token_res.status_code}")
     
     if token_res.status_code != 200:
         print(f"Token exchange failed!")
