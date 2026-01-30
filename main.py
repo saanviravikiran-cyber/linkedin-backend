@@ -187,9 +187,10 @@ def linkedin_callback(request: Request):
     access_token = token_data["access_token"]
     expires_in = token_data["expires_in"]
 
-    # 2. Fetch LinkedIn profile using OpenID Connect
+    # 2. Fetch LinkedIn profile using v2 API (not OpenID)
+    print(f"=== Fetching LinkedIn Profile ===")
     profile_res = requests.get(
-        "https://api.linkedin.com/v2/userinfo",
+        "https://api.linkedin.com/v2/me",
         headers={
             "Authorization": f"Bearer {access_token}",
         },
@@ -197,10 +198,14 @@ def linkedin_callback(request: Request):
     )
 
     if profile_res.status_code != 200:
+        print(f"Profile fetch failed: {profile_res.text}")
         raise HTTPException(status_code=400, detail="Failed to fetch LinkedIn profile")
 
     profile = profile_res.json()
-    linkedin_id = profile["sub"]  # OpenID Connect uses 'sub' for user ID
+    print(f"Profile response: {profile}")
+    
+    # LinkedIn v2 API returns id directly
+    linkedin_id = profile["id"]
     linkedin_urn = f"urn:li:person:{linkedin_id}"
 
     # 3. Encrypt token
