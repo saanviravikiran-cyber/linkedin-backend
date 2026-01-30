@@ -226,10 +226,10 @@ def linkedin_callback(request: Request):
     access_token = token_data["access_token"]
     expires_in = token_data["expires_in"]
 
-    # 2. Fetch LinkedIn profile using OpenID Connect userinfo
+    # 2. Fetch LinkedIn profile using v2 API
     print(f"=== Fetching LinkedIn Profile ===")
     profile_res = requests.get(
-        "https://api.linkedin.com/v2/userinfo",
+        "https://api.linkedin.com/v2/me",
         headers={
             "Authorization": f"Bearer {access_token}",
         },
@@ -243,8 +243,8 @@ def linkedin_callback(request: Request):
     profile = profile_res.json()
     print(f"Profile response: {profile}")
     
-    # OpenID returns 'sub' as the user identifier
-    linkedin_id = profile["sub"]
+    # LinkedIn v2 API returns 'id' as the user identifier
+    linkedin_id = profile["id"]
     linkedin_urn = f"urn:li:person:{linkedin_id}"
 
     # 3. Encrypt token
