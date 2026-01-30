@@ -127,11 +127,20 @@ def manual_post(user_id: str, text: str):
 
     return create_linkedin_post(user, text)
 
+# -------------------------------------------------
+# OAuth callback endpoint
+# -------------------------------------------------
 @app.get("/callback")
 def linkedin_callback(request: Request):
     code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
+    
+    # Optional: validate state parameter if you're storing it during OAuth init
+    # if state != expected_state:
+    #     raise HTTPException(status_code=400, detail="Invalid state parameter")
 
     # 1. Exchange code for access token
     token_res = requests.post(
@@ -154,16 +163,20 @@ def linkedin_callback(request: Request):
     access_token = token_data["access_token"]
     expires_in = token_data["expires_in"]
 
-    # 2. Fetch LinkedIn profile
-    profile = profile_res.json()
-    linkedin_id = profile["sub"]   # OpenID user ID
-    linkedin_urn = f"urn:li:person:{linkedin_id}"
+    # 2. Fetch LinkedIn profile using OpenID Connect
+    profile_res = requests.get(
+        "https://api.linkedin.com/v2/userinfo",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+        timeout=10,
+    )
 
     if profile_res.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch LinkedIn profile")
 
     profile = profile_res.json()
-    linkedin_id = profile.get("id")
+    linkedin_id = profile["sub"]  # OpenID Connect uses 'sub' for user ID
     linkedin_urn = f"urn:li:person:{linkedin_id}"
 
     # 3. Encrypt token
@@ -199,4 +212,3 @@ def linkedin_callback(request: Request):
         "linkedin_urn": linkedin_urn,
         "expires_in": expires_in,
     }
-
