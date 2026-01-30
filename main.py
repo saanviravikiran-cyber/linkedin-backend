@@ -134,29 +134,53 @@ def manual_post(user_id: str, text: str):
 def linkedin_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description")
+    
+    # Log incoming request
+    print(f"=== OAuth Callback Received ===")
+    print(f"Code (first 20 chars): {code[:20] if code else 'None'}...")
+    print(f"State: {state}")
+    print(f"Error: {error}")
+    print(f"Error Description: {error_description}")
+    print(f"Full query params: {dict(request.query_params)}")
+    
+    # Check for OAuth errors
+    if error:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"LinkedIn OAuth error: {error} - {error_description}"
+        )
     
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
     
-    # Optional: validate state parameter if you're storing it during OAuth init
-    # if state != expected_state:
-    #     raise HTTPException(status_code=400, detail="Invalid state parameter")
-
     # 1. Exchange code for access token
+    print(f"=== Exchanging Code for Token ===")
+    print(f"CLIENT_ID: {CLIENT_ID}")
+    print(f"REDIRECT_URI: {REDIRECT_URI}")
+    print(f"CLIENT_SECRET: {'*' * 10} (hidden)")
+    
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+    }
+    
     token_res = requests.post(
         "https://www.linkedin.com/oauth/v2/accessToken",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
+        data=token_data,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=10,
     )
 
+    print(f"Token response status: {token_res.status_code}")
+    
     if token_res.status_code != 200:
+        print(f"Token exchange failed!")
+        print(f"Response: {token_res.text}")
         raise HTTPException(status_code=400, detail=token_res.text)
 
     token_data = token_res.json()
