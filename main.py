@@ -6,21 +6,18 @@ from fastapi import Request
 from cryptography.fernet import Fernet
 import requests
 import os
-import hashlib
-import base64
 from typing import Optional
 
 # -------------------------------------------------
 # Environment variables
 # -------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
-CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
-CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
+COMPOSIO_AUTH_CONFIG_ID = os.getenv("COMPOSIO_AUTH_CONFIG_ID", "ac_TeOqCrPUelSx")
+COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")  # Add this to Railway
 FERNET_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
-REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI")
 AGENT_TOKEN = os.getenv("AGENT_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkZXZfNmUyZjk0OWYtNWVkNi00MTA4LTgzYTItZTE0ZmNkMGEyZGZiIiwiZXhwIjoxNzY5ODU3MzY2fQ.DpcNPbwGljxWs7yTbTj0RAaOXj8JOVdXKWbx9oSMff8")
 
-if not all([MONGO_URI, CLIENT_ID, CLIENT_SECRET, FERNET_KEY, REDIRECT_URI]):
+if not all([MONGO_URI, COMPOSIO_API_KEY, FERNET_KEY]):
     raise RuntimeError("Missing required environment variables")
 
 fernet = Fernet(FERNET_KEY)
@@ -49,7 +46,6 @@ def verify_agent_token(authorization: Optional[str] = Header(None)):
 client = MongoClient(MONGO_URI)
 db = client["linkedin_agent"]
 users = db["users"]
-pkce_states = db["pkce_states"]  # Store PKCE code_verifiers temporarily
 
 # -------------------------------------------------
 # FastAPI app
@@ -57,226 +53,211 @@ pkce_states = db["pkce_states"]  # Store PKCE code_verifiers temporarily
 app = FastAPI()
 
 # -------------------------------------------------
-# Helpers
+# Composio Integration
 # -------------------------------------------------
-def is_token_expired(user: dict) -> bool:
-    expires_at = user.get("auth", {}).get("expires_at")
-    if not expires_at:
-        return True
-    return datetime.utcnow() >= expires_at
-
-
-def get_access_token(user: dict) -> str:
-    encrypted = user.get("auth", {}).get("access_token")
-    if not encrypted:
-        raise HTTPException(status_code=401, detail="Missing access token")
-    return fernet.decrypt(encrypted.encode()).decode()
-
-
-def create_linkedin_post(user: dict, text: str):
-    if is_token_expired(user):
-        raise HTTPException(
-            status_code=401,
-            detail="LinkedIn token expired. User must re-authenticate."
-        )
-
-    access_token = get_access_token(user)
-    author_urn = user.get("linkedin", {}).get("urn")
-
-    if not author_urn:
-        raise HTTPException(status_code=400, detail="Missing LinkedIn URN")
-
-    response = requests.post(
-        "https://api.linkedin.com/v2/ugcPosts",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "X-Restli-Protocol-Version": "2.0.0",
-        },
-        json={
-            "author": author_urn,
-            "lifecycleState": "PUBLISHED",
-            "specificContent": {
-                "com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": text},
-                    "shareMediaCategory": "NONE",
-                }
+def get_composio_connection(entity_id: str):
+    """Get LinkedIn connection from Composio for a specific entity"""
+    try:
+        response = requests.get(
+            f"https://backend.composio.dev/api/v1/connectedAccounts",
+            headers={
+                "X-API-Key": COMPOSIO_API_KEY,
             },
-            "visibility": {
-                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+            params={
+                "user_uuid": entity_id,
+                "appName": "linkedin"
             },
-        },
-        timeout=10,
-    )
-
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=response.text
+            timeout=10
         )
+        
+        if response.status_code == 200:
+            connections = response.json().get("items", [])
+            if connections:
+                return connections[0]  # Return first LinkedIn connection
+        return None
+    except Exception as e:
+        print(f"Error fetching Composio connection: {e}")
+        return None
 
-    res = response.json()
-    post_id = res.get("id")
-
-    if post_id:
-        users.update_one(
-            {"_id": user["_id"]},
-            {"$push": {
-                "posts": {
-                    "post_id": post_id,
-                    "text": text,
-                    "posted_at": datetime.utcnow(),
-                }
-            }},
+def execute_composio_action(entity_id: str, action: str, input_data: dict):
+    """Execute a Composio action for LinkedIn"""
+    try:
+        response = requests.post(
+            f"https://backend.composio.dev/api/v2/actions/{action}/execute",
+            headers={
+                "X-API-Key": COMPOSIO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "entityId": entity_id,
+                "input": input_data
+            },
+            timeout=30
         )
-
-    return res
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Composio action failed: {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error executing Composio action: {e}")
+        return None
 
 # -------------------------------------------------
 # Health check
 # -------------------------------------------------
 @app.get("/")
 def health():
-    return {"status": "backend running"}
+    return {"status": "backend running", "composio_enabled": True}
 
 # -------------------------------------------------
-# PKCE State Management
+# Composio Auth Endpoint
 # -------------------------------------------------
-@app.post("/pkce/store")
-def store_pkce_state(state: str, code_verifier: str, code_challenge: str = None):
-    """Store PKCE code_verifier and code_challenge temporarily, expires in 10 minutes"""
-    pkce_states.insert_one({
-        "state": state,
-        "code_verifier": code_verifier,
-        "code_challenge": code_challenge,  # Store for verification
-        "created_at": datetime.utcnow(),
-        "expires_at": datetime.utcnow() + timedelta(minutes=10)
-    })
-    return {"status": "stored"}
+@app.get("/auth/composio")
+def get_composio_auth_url(entity_id: str):
+    """Get Composio authentication URL for LinkedIn"""
+    try:
+        response = requests.post(
+            "https://backend.composio.dev/api/v1/connectedAccounts",
+            headers={
+                "X-API-Key": COMPOSIO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "integrationId": COMPOSIO_AUTH_CONFIG_ID,
+                "userUuid": entity_id,
+                "redirectUrl": "https://linkedin-backend-production-1a8f.up.railway.app/auth/callback"
+            },
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "auth_url": data.get("redirectUrl"),
+                "connection_id": data.get("connectionId"),
+                "entity_id": entity_id
+            }
+        else:
+            raise HTTPException(status_code=400, detail=response.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -------------------------------------------------
+# Check connection status
+# -------------------------------------------------
+@app.get("/auth/status/{entity_id}")
+def check_auth_status(entity_id: str):
+    """Check if entity has active LinkedIn connection"""
+    connection = get_composio_connection(entity_id)
+    
+    if connection:
+        return {
+            "connected": True,
+            "entity_id": entity_id,
+            "connection_id": connection.get("id"),
+            "status": connection.get("status"),
+            "app_name": connection.get("appName")
+        }
+    else:
+        return {
+            "connected": False,
+            "entity_id": entity_id,
+            "message": "No LinkedIn connection found"
+        }
 
 # -------------------------------------------------
 # Manual post endpoint (used by agent tool) - PROTECTED
 # -------------------------------------------------
 @app.post("/post")
-def manual_post(user_id: str, text: str, authenticated: bool = Depends(verify_agent_token)):
-    """Post to LinkedIn - requires valid agent token"""
-    user = users.find_one({"linkedin.user_id": user_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return create_linkedin_post(user, text)
-
-# -------------------------------------------------
-# OAuth callback endpoint
-# -------------------------------------------------
-@app.get("/callback")
-def linkedin_callback(request: Request):
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    error = request.query_params.get("error")
-    error_description = request.query_params.get("error_description")
+def manual_post(entity_id: str, text: str, authenticated: bool = Depends(verify_agent_token)):
+    """Post to LinkedIn via Composio - requires valid agent token"""
+    print(f"Posting for entity: {entity_id}")
     
-    # Log incoming request
-    print(f"=== OAuth Callback Received ===")
-    print(f"Code (first 20 chars): {code[:20] if code else 'None'}...")
-    print(f"State: {state}")
-    print(f"Error: {error}")
-    print(f"Error Description: {error_description}")
-    
-    # Check for OAuth errors
-    if error:
+    # Check if user has Composio connection
+    connection = get_composio_connection(entity_id)
+    if not connection:
         raise HTTPException(
-            status_code=400, 
-            detail=f"LinkedIn OAuth error: {error} - {error_description}")
+            status_code=404, 
+            detail="LinkedIn not connected via Composio. Please authenticate first."
+        )
     
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code")
-    
-    # SIMPLE OAuth 2.0 token exchange - NO PKCE
-    print(f"=== Exchanging Code for Token (Simple OAuth) ===")
-    print(f"CLIENT_ID: {CLIENT_ID}")
-    print(f"REDIRECT_URI: {REDIRECT_URI}")
-    
-    token_data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI,
-    }
-    
-    print(f"Sending token request...")
-    print(f"Request body: {token_data}")
-    
-    token_res = requests.post(
-        "https://www.linkedin.com/oauth/v2/accessToken",
-        data=token_data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=10,
+    # Execute LinkedIn post action via Composio
+    result = execute_composio_action(
+        entity_id=entity_id,
+        action="LINKEDIN_CREATE_POST",
+        input_data={
+            "text": text,
+            "visibility": "PUBLIC"
+        }
     )
-
-    print(f"Token response status: {token_res.status_code}")
-    print(f"Full response: {token_res.text}")
     
-    if token_res.status_code != 200:
-        print(f"Token exchange failed!")
-        raise HTTPException(status_code=400, detail=token_res.text)
-
-    token_data = token_res.json()
-    access_token = token_data["access_token"]
-    expires_in = token_data["expires_in"]
-
-    # 2. Fetch LinkedIn profile using v2 API
-    print(f"=== Fetching LinkedIn Profile ===")
-    profile_res = requests.get(
-        "https://api.linkedin.com/v2/me",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-        },
-        timeout=10,
-    )
-
-    if profile_res.status_code != 200:
-        print(f"Profile fetch failed: {profile_res.text}")
-        raise HTTPException(status_code=400, detail="Failed to fetch LinkedIn profile")
-
-    profile = profile_res.json()
-    print(f"Profile response: {profile}")
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to post to LinkedIn")
     
-    # LinkedIn v2 API returns 'id' as the user identifier
-    linkedin_id = profile["id"]
-    linkedin_urn = f"urn:li:person:{linkedin_id}"
-
-    # 3. Encrypt token
-    encrypted_token = fernet.encrypt(access_token.encode()).decode()
-
-    # 4. Store / upsert user
+    # Store post in MongoDB
     users.update_one(
-        {"linkedin.user_id": linkedin_id},
+        {"composio_entity_id": entity_id},
         {
+            "$push": {
+                "posts": {
+                    "post_id": result.get("data", {}).get("id"),
+                    "text": text,
+                    "posted_at": datetime.utcnow(),
+                    "composio_result": result
+                }
+            },
             "$set": {
-                "linkedin": {
-                    "user_id": linkedin_id,
-                    "urn": linkedin_urn,
-                },
-                "auth": {
-                    "access_token": encrypted_token,
-                    "expires_at": datetime.utcnow() + timedelta(seconds=expires_in),
-                },
-                "updated_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
             },
             "$setOnInsert": {
-                "drafts": [],
-                "posts": [],
                 "created_at": datetime.utcnow(),
-            },
+                "drafts": []
+            }
         },
-        upsert=True,
+        upsert=True
     )
-
+    
     return {
-        "message": "LinkedIn connected successfully",
-        "linkedin_user_id": linkedin_id,
-        "linkedin_urn": linkedin_urn,
-        "expires_in": expires_in,
+        "success": True,
+        "message": "Posted to LinkedIn successfully",
+        "result": result
     }
+
+# -------------------------------------------------
+# PKCE State Management (kept for backward compatibility)
+# -------------------------------------------------
+@app.post("/pkce/store")
+def store_pkce_state(state: str, code_verifier: str, code_challenge: str = None):
+    """Legacy endpoint - not used with Composio"""
+    return {"status": "deprecated", "message": "Use Composio auth instead"}
+
+# -------------------------------------------------
+# Draft management
+# -------------------------------------------------
+@app.post("/drafts")
+def save_draft(entity_id: str, content: str, tags: list = []):
+    """Save a draft post"""
+    draft_id = f"draft_{datetime.utcnow().timestamp()}"
+    
+    users.update_one(
+        {"composio_entity_id": entity_id},
+        {
+            "$push": {
+                "drafts": {
+                    "draft_id": draft_id,
+                    "content": content,
+                    "tags": tags,
+                    "created_at": datetime.utcnow()
+                }
+            },
+            "$setOnInsert": {
+                "created_at": datetime.utcnow(),
+                "posts": []
+            }
+        },
+        upsert=True
+    )
+    
+    return {"draft_id": draft_id, "status": "saved"}
